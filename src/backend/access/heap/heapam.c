@@ -72,6 +72,7 @@
 #include "utils/relcache.h"
 #include "utils/snapmgr.h"
 #include "utils/spccache.h"
+#include "utils/injection_point.h"
 
 
 static HeapTuple heap_prepare_insert(Relation relation, HeapTuple tup,
@@ -4752,9 +4753,10 @@ failed:
 	compute_new_xmax_infomask(xmax, old_infomask, tuple->t_data->t_infomask2,
 							  GetCurrentTransactionId(), mode, false,
 							  &xid, &new_infomask, &new_infomask2);
-
+	INJECTION_POINT_LOAD("heap_lock_test");
+	
 	START_CRIT_SECTION();
-
+	INJECTION_POINT_CACHED("heap_lock_test", NULL);
 	/*
 	 * Store transaction information of xact locking the tuple.
 	 *

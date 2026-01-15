@@ -48,6 +48,7 @@
 #include "storage/sinvaladt.h"
 #include "storage/spin.h"
 #include "utils/guc.h"
+#include "utils/injection_point.h"
 #include "utils/snapmgr.h"
 
 /* GUCs */
@@ -142,6 +143,7 @@ CalculateShmemSize(int *num_semaphores)
 	size = add_size(size, SyncScanShmemSize());
 	size = add_size(size, AsyncShmemSize());
 	size = add_size(size, StatsShmemSize());
+	size = add_size(size, InjectionPointShmemSize());
 #ifdef EXEC_BACKEND
 	size = add_size(size, ShmemBackendArraySize());
 #endif
@@ -294,6 +296,7 @@ CreateSharedMemoryAndSemaphores(void)
 	SyncScanShmemInit();
 	AsyncShmemInit();
 	StatsShmemInit();
+	InjectionPointShmemInit();
 
 #ifdef EXEC_BACKEND
 

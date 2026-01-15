@@ -1,0 +1,2107 @@
+diff --git a/configure.ac b/configure.ac
+index bf0cfdf2ba..f05769cd4a 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -19,10 +19,10 @@ m4_pattern_forbid(^PGAC_)dnl to catch undefined macros
+ 
+ AC_INIT([PostgreSQL], [16.4], [pgsql-bugs@lists.postgresql.org], [], [https://www.postgresql.org/])
+ 
+-m4_if(m4_defn([m4_PACKAGE_VERSION]), [2.69], [], [m4_fatal([Autoconf version 2.69 is required.
++m4_if(m4_defn([m4_PACKAGE_VERSION]), [2.69], [], [m4_if(m4_defn([m4_PACKAGE_VERSION]), [2.71], [], [m4_fatal([Autoconf version 2.69 or 2.71 is required.
+ Untested combinations of 'autoconf' and PostgreSQL versions are not
+ recommended.  You can remove the check from 'configure.ac' but it is then
+-your responsibility whether the result works or not.])])
++your responsibility whether the result works or not.])])])
+ AC_COPYRIGHT([Copyright (c) 1996-2023, PostgreSQL Global Development Group])
+ AC_CONFIG_SRCDIR([src/backend/access/common/heaptuple.c])
+ AC_CONFIG_AUX_DIR(config)
+@@ -206,6 +206,13 @@ PGAC_ARG_BOOL(enable, debug, no,
+               [build with debugging symbols (-g)])
+ AC_SUBST(enable_debug)
+ 
++#
++# Injection points
++#
++PGAC_ARG_BOOL(enable, injection-points, no, [enable injection points (for testing)],
++              [AC_DEFINE([USE_INJECTION_POINTS], 1, [Define to 1 to build with injection points. (--enable-injection-points)])])
++AC_SUBST(enable_injection_points)
++
+ #
+ # --enable-profiling enables gcc profiling
+ #
+diff --git a/src/Makefile.global.in b/src/Makefile.global.in
+index cc4dc6de91..5ab14893bc 100644
+--- a/src/Makefile.global.in
++++ b/src/Makefile.global.in
+@@ -201,6 +201,7 @@ enable_nls	= @enable_nls@
+ enable_debug	= @enable_debug@
+ enable_dtrace	= @enable_dtrace@
+ enable_coverage	= @enable_coverage@
++enable_injection_points = @enable_injection_points@
+ enable_tap_tests	= @enable_tap_tests@
+ enable_thread_safety	= @enable_thread_safety@
+ 
+diff --git a/src/backend/storage/ipc/ipci.c b/src/backend/storage/ipc/ipci.c
+index 8f1ded7338..cde6dc439a 100644
+--- a/src/backend/storage/ipc/ipci.c
++++ b/src/backend/storage/ipc/ipci.c
+@@ -48,6 +48,7 @@
+ #include "storage/sinvaladt.h"
+ #include "storage/spin.h"
+ #include "utils/guc.h"
++#include "utils/injection_point.h"
+ #include "utils/snapmgr.h"
+ 
+ /* GUCs */
+@@ -142,6 +143,7 @@ CalculateShmemSize(int *num_semaphores)
+ 	size = add_size(size, SyncScanShmemSize());
+ 	size = add_size(size, AsyncShmemSize());
+ 	size = add_size(size, StatsShmemSize());
++	size = add_size(size, InjectionPointShmemSize());
+ #ifdef EXEC_BACKEND
+ 	size = add_size(size, ShmemBackendArraySize());
+ #endif
+@@ -294,6 +296,7 @@ CreateSharedMemoryAndSemaphores(void)
+ 	SyncScanShmemInit();
+ 	AsyncShmemInit();
+ 	StatsShmemInit();
++	InjectionPointShmemInit();
+ 
+ #ifdef EXEC_BACKEND
+ 
+diff --git a/src/backend/storage/lmgr/lwlocknames.txt b/src/backend/storage/lmgr/lwlocknames.txt
+index 873ca265c5..257e01af12 100644
+--- a/src/backend/storage/lmgr/lwlocknames.txt
++++ b/src/backend/storage/lmgr/lwlocknames.txt
+@@ -54,3 +54,4 @@ XactTruncationLock					44
+ WrapLimitsVacuumLock				46
+ NotifyQueueTailLock					47
+ TsqlApplockSyncLock					49
++InjectionPointLock					50
+diff --git a/src/backend/utils/misc/Makefile b/src/backend/utils/misc/Makefile
+index 2910032930..f0203501d1 100644
+--- a/src/backend/utils/misc/Makefile
++++ b/src/backend/utils/misc/Makefile
+@@ -21,6 +21,7 @@ OBJS = \
+ 	guc_funcs.o \
+ 	guc_tables.o \
+ 	help_config.o \
++	injection_point.o \
+ 	pg_config.o \
+ 	pg_controldata.o \
+ 	pg_rusage.o \
+diff --git a/src/backend/utils/misc/injection_point.c b/src/backend/utils/misc/injection_point.c
+new file mode 100644
+index 0000000000..730d900caa
+--- /dev/null
++++ b/src/backend/utils/misc/injection_point.c
+@@ -0,0 +1,606 @@
++/*-------------------------------------------------------------------------
++ *
++ * injection_point.c
++ *	  Routines to control and run injection points in the code.
++ *
++ * Injection points can be used to run arbitrary code by attaching callbacks
++ * that would be executed in place of the named injection point.
++ *
++ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
++ * Portions Copyright (c) 1994, Regents of the University of California
++ *
++ *
++ * IDENTIFICATION
++ *	  src/backend/utils/misc/injection_point.c
++ *
++ *-------------------------------------------------------------------------
++ */
++#include "postgres.h"
++
++#include "utils/injection_point.h"
++
++#ifdef USE_INJECTION_POINTS
++
++#include <sys/stat.h>
++
++#include "fmgr.h"
++#include "miscadmin.h"
++#include "storage/fd.h"
++#include "storage/lwlock.h"
++#include "storage/shmem.h"
++#include "utils/hsearch.h"
++#include "utils/memutils.h"
++
++/* Field sizes */
++#define INJ_NAME_MAXLEN		64
++#define INJ_LIB_MAXLEN		128
++#define INJ_FUNC_MAXLEN		128
++#define INJ_PRIVATE_MAXLEN	1024
++
++/* Single injection point stored in shared memory */
++typedef struct InjectionPointEntry
++{
++	/*
++	 * Because injection points need to be usable without LWLocks, we use a
++	 * generation counter on each entry to allow safe, lock-free reading.
++	 *
++	 * To read an entry, first read the current 'generation' value.  If it's
++	 * even, then the slot is currently unused, and odd means it's in use.
++	 * When reading the other fields, beware that they may change while
++	 * reading them, if the entry is released and reused!  After reading the
++	 * other fields, read 'generation' again: if its value hasn't changed, you
++	 * can be certain that the other fields you read are valid.  Otherwise,
++	 * the slot was concurrently recycled, and you should ignore it.
++	 *
++	 * When adding an entry, you must store all the other fields first, and
++	 * then update the generation number, with an appropriate memory barrier
++	 * in between. In addition to that protocol, you must also hold
++	 * InjectionPointLock, to prevent two backends from modifying the array at
++	 * the same time.
++	 */
++	pg_atomic_uint64 generation;
++
++	char		name[INJ_NAME_MAXLEN];	/* point name */
++	char		library[INJ_LIB_MAXLEN];	/* library */
++	char		function[INJ_FUNC_MAXLEN];	/* function */
++
++	/*
++	 * Opaque data area that modules can use to pass some custom data to
++	 * callbacks, registered when attached.
++	 */
++	char		private_data[INJ_PRIVATE_MAXLEN];
++} InjectionPointEntry;
++
++#define MAX_INJECTION_POINTS	128
++
++/*
++ * Shared memory array of active injection points.
++ *
++ * 'max_inuse' is the highest index currently in use, plus one.  It's just an
++ * optimization to avoid scanning through the whole entry, in the common case
++ * that there are no injection points, or only a few.
++ */
++typedef struct InjectionPointsCtl
++{
++	pg_atomic_uint32 max_inuse;
++	InjectionPointEntry entries[MAX_INJECTION_POINTS];
++} InjectionPointsCtl;
++
++NON_EXEC_STATIC InjectionPointsCtl *ActiveInjectionPoints;
++
++/*
++ * Backend local cache of injection callbacks already loaded, stored in
++ * TopMemoryContext.
++ */
++typedef struct InjectionPointCacheEntry
++{
++	char		name[INJ_NAME_MAXLEN];
++	char		private_data[INJ_PRIVATE_MAXLEN];
++	InjectionPointCallback callback;
++
++	/*
++	 * Shmem slot and copy of its generation number when this cache entry was
++	 * created.  They can be used to validate if the cached entry is still
++	 * valid.
++	 */
++	int			slot_idx;
++	uint64		generation;
++} InjectionPointCacheEntry;
++
++static HTAB *InjectionPointCache = NULL;
++
++/*
++ * Check if the file exists.
++ */
++static bool
++pg_file_exists(const char *name)
++{
++	struct stat st;
++
++	Assert(name != NULL);
++
++	if (stat(name, &st) == 0)
++		return S_ISDIR(st.st_mode) ? false : true;
++	else if (!(errno == ENOENT || errno == ENOTDIR || errno == EACCES))
++		ereport(ERROR,
++				(errcode_for_file_access(),
++				 errmsg("could not access file \"%s\": %m", name)));
++
++	return false;
++}
++
++/*
++ * injection_point_cache_add
++ *
++ * Add an injection point to the local cache.
++ */
++static InjectionPointCacheEntry *
++injection_point_cache_add(const char *name,
++						  int slot_idx,
++						  uint64 generation,
++						  InjectionPointCallback callback,
++						  const void *private_data)
++{
++	InjectionPointCacheEntry *entry;
++	bool		found;
++
++	/* If first time, initialize */
++	if (InjectionPointCache == NULL)
++	{
++		HASHCTL		hash_ctl;
++
++		hash_ctl.keysize = sizeof(char[INJ_NAME_MAXLEN]);
++		hash_ctl.entrysize = sizeof(InjectionPointCacheEntry);
++		hash_ctl.hcxt = TopMemoryContext;
++
++		InjectionPointCache = hash_create("InjectionPoint cache hash",
++										  MAX_INJECTION_POINTS,
++										  &hash_ctl,
++										  HASH_ELEM | HASH_STRINGS | HASH_CONTEXT);
++	}
++
++	entry = (InjectionPointCacheEntry *)
++		hash_search(InjectionPointCache, name, HASH_ENTER, &found);
++
++	Assert(!found);
++	strlcpy(entry->name, name, sizeof(entry->name));
++	entry->slot_idx = slot_idx;
++	entry->generation = generation;
++	entry->callback = callback;
++	memcpy(entry->private_data, private_data, INJ_PRIVATE_MAXLEN);
++
++	return entry;
++}
++
++/*
++ * injection_point_cache_remove
++ *
++ * Remove entry from the local cache.  Note that this leaks a callback
++ * loaded but removed later on, which should have no consequence from
++ * a testing perspective.
++ */
++static void
++injection_point_cache_remove(const char *name)
++{
++	bool		found PG_USED_FOR_ASSERTS_ONLY;
++
++	(void) hash_search(InjectionPointCache, name, HASH_REMOVE, &found);
++	Assert(found);
++}
++
++/*
++ * injection_point_cache_load
++ *
++ * Load an injection point into the local cache.
++ */
++static InjectionPointCacheEntry *
++injection_point_cache_load(InjectionPointEntry *entry, int slot_idx, uint64 generation)
++{
++	char		path[MAXPGPATH];
++	void	   *injection_callback_local;
++
++	snprintf(path, MAXPGPATH, "%s/%s%s", pkglib_path,
++			 entry->library, DLSUFFIX);
++
++	if (!pg_file_exists(path))
++		elog(ERROR, "could not find library \"%s\" for injection point \"%s\"",
++			 path, entry->name);
++
++	injection_callback_local = (void *)
++		load_external_function(path, entry->function, false, NULL);
++
++	if (injection_callback_local == NULL)
++		elog(ERROR, "could not find function \"%s\" in library \"%s\" for injection point \"%s\"",
++			 entry->function, path, entry->name);
++
++	/* add it to the local cache */
++	return injection_point_cache_add(entry->name,
++									 slot_idx,
++									 generation,
++									 injection_callback_local,
++									 entry->private_data);
++}
++
++/*
++ * injection_point_cache_get
++ *
++ * Retrieve an injection point from the local cache, if any.
++ */
++static InjectionPointCacheEntry *
++injection_point_cache_get(const char *name)
++{
++	bool		found;
++	InjectionPointCacheEntry *entry;
++
++	/* no callback if no cache yet */
++	if (InjectionPointCache == NULL)
++		return NULL;
++
++	entry = (InjectionPointCacheEntry *)
++		hash_search(InjectionPointCache, name, HASH_FIND, &found);
++
++	if (found)
++		return entry;
++
++	return NULL;
++}
++#endif							/* USE_INJECTION_POINTS */
++
++/*
++ * Return the space for dynamic shared hash table.
++ */
++Size
++InjectionPointShmemSize(void)
++{
++#ifdef USE_INJECTION_POINTS
++	Size		sz = 0;
++
++	sz = add_size(sz, sizeof(InjectionPointsCtl));
++	return sz;
++#else
++	return 0;
++#endif
++}
++
++/*
++ * Allocate shmem space for dynamic shared hash.
++ */
++void
++InjectionPointShmemInit(void)
++{
++#ifdef USE_INJECTION_POINTS
++	bool		found;
++
++	ActiveInjectionPoints = ShmemInitStruct("InjectionPoint hash",
++											sizeof(InjectionPointsCtl),
++											&found);
++	if (!IsUnderPostmaster)
++	{
++		Assert(!found);
++		pg_atomic_init_u32(&ActiveInjectionPoints->max_inuse, 0);
++		for (int i = 0; i < MAX_INJECTION_POINTS; i++)
++			pg_atomic_init_u64(&ActiveInjectionPoints->entries[i].generation, 0);
++	}
++	else
++		Assert(found);
++#endif
++}
++
++/*
++ * Attach a new injection point.
++ */
++void
++InjectionPointAttach(const char *name,
++					 const char *library,
++					 const char *function,
++					 const void *private_data,
++					 int private_data_size)
++{
++#ifdef USE_INJECTION_POINTS
++	InjectionPointEntry *entry;
++	uint64		generation;
++	uint32		max_inuse;
++	int			free_idx;
++
++	if (strlen(name) >= INJ_NAME_MAXLEN)
++		elog(ERROR, "injection point name %s too long (maximum of %u)",
++			 name, INJ_NAME_MAXLEN);
++	if (strlen(library) >= INJ_LIB_MAXLEN)
++		elog(ERROR, "injection point library %s too long (maximum of %u)",
++			 library, INJ_LIB_MAXLEN);
++	if (strlen(function) >= INJ_FUNC_MAXLEN)
++		elog(ERROR, "injection point function %s too long (maximum of %u)",
++			 function, INJ_FUNC_MAXLEN);
++	if (private_data_size >= INJ_PRIVATE_MAXLEN)
++		elog(ERROR, "injection point data too long (maximum of %u)",
++			 INJ_PRIVATE_MAXLEN);
++
++	/*
++	 * Allocate and register a new injection point.  A new point should not
++	 * exist.  For testing purposes this should be fine.
++	 */
++	LWLockAcquire(InjectionPointLock, LW_EXCLUSIVE);
++	max_inuse = pg_atomic_read_u32(&ActiveInjectionPoints->max_inuse);
++	free_idx = -1;
++
++	for (int idx = 0; idx < max_inuse; idx++)
++	{
++		entry = &ActiveInjectionPoints->entries[idx];
++		generation = pg_atomic_read_u64(&entry->generation);
++		if (generation % 2 == 0)
++		{
++			/*
++			 * Found a free slot where we can add the new entry, but keep
++			 * going so that we will find out if the entry already exists.
++			 */
++			if (free_idx == -1)
++				free_idx = idx;
++		}
++		else if (strcmp(entry->name, name) == 0)
++			elog(ERROR, "injection point \"%s\" already defined", name);
++	}
++	if (free_idx == -1)
++	{
++		if (max_inuse == MAX_INJECTION_POINTS)
++			elog(ERROR, "too many injection points");
++		free_idx = max_inuse;
++	}
++	entry = &ActiveInjectionPoints->entries[free_idx];
++	generation = pg_atomic_read_u64(&entry->generation);
++	Assert(generation % 2 == 0);
++
++	/* Save the entry */
++	strlcpy(entry->name, name, sizeof(entry->name));
++	entry->name[INJ_NAME_MAXLEN - 1] = '\0';
++	strlcpy(entry->library, library, sizeof(entry->library));
++	entry->library[INJ_LIB_MAXLEN - 1] = '\0';
++	strlcpy(entry->function, function, sizeof(entry->function));
++	entry->function[INJ_FUNC_MAXLEN - 1] = '\0';
++	if (private_data != NULL)
++		memcpy(entry->private_data, private_data, private_data_size);
++
++	pg_write_barrier();
++	pg_atomic_write_u64(&entry->generation, generation + 1);
++
++	if (free_idx + 1 > max_inuse)
++		pg_atomic_write_u32(&ActiveInjectionPoints->max_inuse, free_idx + 1);
++
++	LWLockRelease(InjectionPointLock);
++
++#else
++	elog(ERROR, "injection points are not supported by this build");
++#endif
++}
++
++/*
++ * Detach an existing injection point.
++ *
++ * Returns true if the injection point was detached, false otherwise.
++ */
++bool
++InjectionPointDetach(const char *name)
++{
++#ifdef USE_INJECTION_POINTS
++	bool		found = false;
++	int			idx;
++	int			max_inuse;
++
++	LWLockAcquire(InjectionPointLock, LW_EXCLUSIVE);
++
++	/* Find it in the shmem array, and mark the slot as unused */
++	max_inuse = (int) pg_atomic_read_u32(&ActiveInjectionPoints->max_inuse);
++	for (idx = max_inuse - 1; idx >= 0; --idx)
++	{
++		InjectionPointEntry *entry = &ActiveInjectionPoints->entries[idx];
++		uint64		generation;
++
++		generation = pg_atomic_read_u64(&entry->generation);
++		if (generation % 2 == 0)
++			continue;			/* empty slot */
++
++		if (strcmp(entry->name, name) == 0)
++		{
++			Assert(!found);
++			found = true;
++			pg_atomic_write_u64(&entry->generation, generation + 1);
++			break;
++		}
++	}
++
++	/* If we just removed the highest-numbered entry, update 'max_inuse' */
++	if (found && idx == max_inuse - 1)
++	{
++		for (; idx >= 0; --idx)
++		{
++			InjectionPointEntry *entry = &ActiveInjectionPoints->entries[idx];
++			uint64		generation;
++
++			generation = pg_atomic_read_u64(&entry->generation);
++			if (generation % 2 != 0)
++				break;
++		}
++		pg_atomic_write_u32(&ActiveInjectionPoints->max_inuse, idx + 1);
++	}
++	LWLockRelease(InjectionPointLock);
++
++	return found;
++#else
++	elog(ERROR, "Injection points are not supported by this build");
++	return true;				/* silence compiler */
++#endif
++}
++
++#ifdef USE_INJECTION_POINTS
++/*
++ * Common workhorse of InjectionPointRun() and InjectionPointLoad()
++ *
++ * Checks if an injection point exists in shared memory, and update
++ * the local cache entry accordingly.
++ */
++static InjectionPointCacheEntry *
++InjectionPointCacheRefresh(const char *name)
++{
++	uint32		max_inuse;
++	int			namelen;
++	InjectionPointEntry local_copy;
++	InjectionPointCacheEntry *cached;
++
++	/*
++	 * First read the number of in-use slots.  More entries can be added or
++	 * existing ones can be removed while we're reading them.  If the entry
++	 * we're looking for is concurrently added or removed, we might or might
++	 * not see it.  That's OK.
++	 */
++	max_inuse = pg_atomic_read_u32(&ActiveInjectionPoints->max_inuse);
++	if (max_inuse == 0)
++	{
++		if (InjectionPointCache)
++		{
++			hash_destroy(InjectionPointCache);
++			InjectionPointCache = NULL;
++		}
++		return NULL;
++	}
++
++	/*
++	 * If we have this entry in the local cache already, check if the cached
++	 * entry is still valid.
++	 */
++	cached = injection_point_cache_get(name);
++	if (cached)
++	{
++		int			idx = cached->slot_idx;
++		InjectionPointEntry *entry = &ActiveInjectionPoints->entries[idx];
++
++		if (pg_atomic_read_u64(&entry->generation) == cached->generation)
++		{
++			/* still good */
++			return cached;
++		}
++		injection_point_cache_remove(name);
++		cached = NULL;
++	}
++
++	/*
++	 * Search the shared memory array.
++	 *
++	 * It's possible that the entry we're looking for is concurrently detached
++	 * or attached.  Or detached *and* re-attached, to the same slot or a
++	 * different slot.  Detach and re-attach is not an atomic operation, so
++	 * it's OK for us to return the old value, NULL, or the new value in such
++	 * cases.
++	 */
++	namelen = strlen(name);
++	for (int idx = 0; idx < max_inuse; idx++)
++	{
++		InjectionPointEntry *entry = &ActiveInjectionPoints->entries[idx];
++		uint64		generation;
++
++		/*
++		 * Read the generation number so that we can detect concurrent
++		 * modifications.  The read barrier ensures that the generation number
++		 * is loaded before any of the other fields.
++		 */
++		generation = pg_atomic_read_u64(&entry->generation);
++		if (generation % 2 == 0)
++			continue;			/* empty slot */
++		pg_read_barrier();
++
++		/* Is this the injection point we're looking for? */
++		if (memcmp(entry->name, name, namelen + 1) != 0)
++			continue;
++
++		/*
++		 * The entry can change at any time, if the injection point is
++		 * concurrently detached.  Copy it to local memory, and re-check the
++		 * generation.  If the generation hasn't changed, we know our local
++		 * copy is coherent.
++		 */
++		memcpy(&local_copy, entry, sizeof(InjectionPointEntry));
++
++		pg_read_barrier();
++		if (pg_atomic_read_u64(&entry->generation) != generation)
++		{
++			/*
++			 * The entry was concurrently detached.
++			 *
++			 * Continue the search, because if the generation number changed,
++			 * we cannot trust the result of the name comparison we did above.
++			 * It's theoretically possible that it falsely matched a mixed-up
++			 * state of the old and new name, if the slot was recycled with a
++			 * different name.
++			 */
++			continue;
++		}
++
++		/* Success! Load it into the cache and return it */
++		return injection_point_cache_load(&local_copy, idx, generation);
++	}
++	return NULL;
++}
++#endif
++
++/*
++ * Load an injection point into the local cache.
++ *
++ * This is useful to be able to load an injection point before running it,
++ * especially if the injection point is called in a code path where memory
++ * allocations cannot happen, like critical sections.
++ */
++void
++InjectionPointLoad(const char *name)
++{
++#ifdef USE_INJECTION_POINTS
++	InjectionPointCacheRefresh(name);
++#else
++	elog(ERROR, "Injection points are not supported by this build");
++#endif
++}
++
++/*
++ * Execute an injection point, if defined.
++ */
++void
++InjectionPointRun(const char *name, void *arg)
++{
++#ifdef USE_INJECTION_POINTS
++	InjectionPointCacheEntry *cache_entry;
++
++	cache_entry = InjectionPointCacheRefresh(name);
++	if (cache_entry)
++		cache_entry->callback(name, cache_entry->private_data, arg);
++#else
++	elog(ERROR, "Injection points are not supported by this build");
++#endif
++}
++
++/*
++ * Execute an injection point directly from the cache, if defined.
++ */
++void
++InjectionPointCached(const char *name, void *arg)
++{
++#ifdef USE_INJECTION_POINTS
++	InjectionPointCacheEntry *cache_entry;
++
++	cache_entry = injection_point_cache_get(name);
++	if (cache_entry)
++		cache_entry->callback(name, cache_entry->private_data, arg);
++#else
++	elog(ERROR, "Injection points are not supported by this build");
++#endif
++}
++
++/*
++ * Test if an injection point is defined.
++ */
++bool
++IsInjectionPointAttached(const char *name)
++{
++#ifdef USE_INJECTION_POINTS
++	return InjectionPointCacheRefresh(name) != NULL;
++#else
++	elog(ERROR, "Injection points are not supported by this build");
++	return false;				/* silence compiler */
++#endif
++}
+diff --git a/src/include/pg_config.h.in b/src/include/pg_config.h.in
+index cb380c96e2..0ba90d54b7 100644
+--- a/src/include/pg_config.h.in
++++ b/src/include/pg_config.h.in
+@@ -711,6 +711,9 @@
+ /* Define to build with ICU support. (--with-icu) */
+ #undef USE_ICU
+ 
++/* Define to 1 to build with injection points. (--enable-injection-points) */
++#undef USE_INJECTION_POINTS
++
+ /* Define to 1 to build with LDAP support. (--with-ldap) */
+ #undef USE_LDAP
+ 
+diff --git a/src/include/utils/injection_point.h b/src/include/utils/injection_point.h
+new file mode 100644
+index 0000000000..a37958e183
+--- /dev/null
++++ b/src/include/utils/injection_point.h
+@@ -0,0 +1,54 @@
++/*-------------------------------------------------------------------------
++ * injection_point.h
++ *	  Definitions related to injection points.
++ *
++ * Copyright (c) 2001-2025, PostgreSQL Global Development Group
++ *
++ * src/include/utils/injection_point.h
++ *-------------------------------------------------------------------------
++ */
++
++#ifndef INJECTION_POINT_H
++#define INJECTION_POINT_H
++
++/*
++ * Injection points require --enable-injection-points.
++ */
++#ifdef USE_INJECTION_POINTS
++#define INJECTION_POINT_LOAD(name) InjectionPointLoad(name)
++#define INJECTION_POINT(name, arg) InjectionPointRun(name, arg)
++#define INJECTION_POINT_CACHED(name, arg) InjectionPointCached(name, arg)
++#define IS_INJECTION_POINT_ATTACHED(name) IsInjectionPointAttached(name)
++#else
++#define INJECTION_POINT_LOAD(name) ((void) name)
++#define INJECTION_POINT(name, arg) ((void) name)
++#define INJECTION_POINT_CACHED(name, arg) ((void) name)
++#define IS_INJECTION_POINT_ATTACHED(name) (false)
++#endif
++
++/*
++ * Typedef for callback function launched by an injection point.
++ */
++typedef void (*InjectionPointCallback) (const char *name,
++										const void *private_data,
++										void *arg);
++
++extern Size InjectionPointShmemSize(void);
++extern void InjectionPointShmemInit(void);
++
++extern void InjectionPointAttach(const char *name,
++								 const char *library,
++								 const char *function,
++								 const void *private_data,
++								 int private_data_size);
++extern void InjectionPointLoad(const char *name);
++extern void InjectionPointRun(const char *name, void *arg);
++extern void InjectionPointCached(const char *name, void *arg);
++extern bool IsInjectionPointAttached(const char *name);
++extern bool InjectionPointDetach(const char *name);
++
++#ifdef EXEC_BACKEND
++extern PGDLLIMPORT struct InjectionPointsCtl *ActiveInjectionPoints;
++#endif
++
++#endif							/* INJECTION_POINT_H */
+diff --git a/src/test/modules/injection_points/Makefile b/src/test/modules/injection_points/Makefile
+new file mode 100644
+index 0000000000..17dee1bef2
+--- /dev/null
++++ b/src/test/modules/injection_points/Makefile
+@@ -0,0 +1,40 @@
++MODULE_big = injection_points
++OBJS = \
++	$(WIN32RES) \
++	injection_points.o
++EXTENSION = injection_points
++DATA = injection_points--1.0.sql
++PGFILEDESC = "injection_points - facility for injection points"
++
++REGRESS = injection_points
++REGRESS_OPTS = --dlpath=$(top_builddir)/src/test/regress --temp-config=$(top_srcdir)/src/test/modules/injection_points/injection_points.conf
++
++TAP_TESTS = 1
++
++# The injection points are cluster-wide, so disable installcheck
++NO_INSTALLCHECK = 1
++
++export enable_injection_points
++
++ifdef USE_PGXS
++PG_CONFIG = pg_config
++PGXS := $(shell $(PG_CONFIG) --pgxs)
++include $(PGXS)
++else
++subdir = src/test/modules/injection_points
++top_builddir = ../../../..
++include $(top_builddir)/src/Makefile.global
++
++# XXX: This test is conditional on enable_injection_points in the
++# parent Makefile, so we should never get here in the first place if
++# injection points are not enabled. But the buildfarm 'misc-check'
++# step doesn't pay attention to the if-condition in the parent
++# Makefile. To work around that, disable running the test here too.
++ifeq ($(enable_injection_points),yes)
++include $(top_srcdir)/contrib/contrib-global.mk
++else
++check:
++	@echo "injection points are disabled in this build"
++endif
++
++endif
+diff --git a/src/test/modules/injection_points/expected/injection_points.out b/src/test/modules/injection_points/expected/injection_points.out
+new file mode 100644
+index 0000000000..43bcdd0158
+--- /dev/null
++++ b/src/test/modules/injection_points/expected/injection_points.out
+@@ -0,0 +1,302 @@
++CREATE EXTENSION injection_points;
++\getenv libdir PG_LIBDIR
++\getenv dlsuffix PG_DLSUFFIX
++\set regresslib :libdir '/regress' :dlsuffix
++CREATE FUNCTION wait_pid(int)
++  RETURNS void
++  AS :'regresslib'
++  LANGUAGE C STRICT;
++-- Non-strict checks
++SELECT injection_points_run(NULL);
++ injection_points_run 
++----------------------
++ 
++(1 row)
++
++SELECT injection_points_cached(NULL);
++ injection_points_cached 
++-------------------------
++ 
++(1 row)
++
++SELECT injection_points_attach('TestInjectionBooh', 'booh');
++ERROR:  incorrect action "booh" for injection point creation
++SELECT injection_points_attach('TestInjectionError', 'error');
++ injection_points_attach 
++-------------------------
++ 
++(1 row)
++
++SELECT injection_points_attach('TestInjectionLog', 'notice');
++ injection_points_attach 
++-------------------------
++ 
++(1 row)
++
++SELECT injection_points_attach('TestInjectionLog2', 'notice');
++ injection_points_attach 
++-------------------------
++ 
++(1 row)
++
++SELECT injection_points_run('TestInjectionBooh'); -- nothing
++ injection_points_run 
++----------------------
++ 
++(1 row)
++
++SELECT injection_points_run('TestInjectionLog2'); -- notice
++NOTICE:  notice triggered for injection point TestInjectionLog2
++ injection_points_run 
++----------------------
++ 
++(1 row)
++
++SELECT injection_points_run('TestInjectionLog2', NULL); -- notice
++NOTICE:  notice triggered for injection point TestInjectionLog2
++ injection_points_run 
++----------------------
++ 
++(1 row)
++
++SELECT injection_points_run('TestInjectionLog2', 'foobar'); -- notice + arg
++NOTICE:  notice triggered for injection point TestInjectionLog2 (foobar)
++ injection_points_run 
++----------------------
++ 
++(1 row)
++
++SELECT injection_points_run('TestInjectionLog'); -- notice
++NOTICE:  notice triggered for injection point TestInjectionLog
++ injection_points_run 
++----------------------
++ 
++(1 row)
++
++SELECT injection_points_run('TestInjectionError'); -- error
++ERROR:  error triggered for injection point TestInjectionError
++SELECT injection_points_run('TestInjectionError', NULL); -- error
++ERROR:  error triggered for injection point TestInjectionError
++SELECT injection_points_run('TestInjectionError', 'foobar2'); -- error + arg
++ERROR:  error triggered for injection point TestInjectionError (foobar2)
++-- Re-load cache and run again.
++\c
++SELECT injection_points_run('TestInjectionLog2'); -- notice
++NOTICE:  notice triggered for injection point TestInjectionLog2
++ injection_points_run 
++----------------------
++ 
++(1 row)
++
++SELECT injection_points_run('TestInjectionLog'); -- notice
++NOTICE:  notice triggered for injection point TestInjectionLog
++ injection_points_run 
++----------------------
++ 
++(1 row)
++
++SELECT injection_points_run('TestInjectionError'); -- error
++ERROR:  error triggered for injection point TestInjectionError
++-- Remove one entry and check the remaining entries.
++SELECT injection_points_detach('TestInjectionError'); -- ok
++ injection_points_detach 
++-------------------------
++ 
++(1 row)
++
++SELECT injection_points_run('TestInjectionLog'); -- notice
++NOTICE:  notice triggered for injection point TestInjectionLog
++ injection_points_run 
++----------------------
++ 
++(1 row)
++
++SELECT injection_points_run('TestInjectionError'); -- nothing
++ injection_points_run 
++----------------------
++ 
++(1 row)
++
++-- More entries removed, letting TestInjectionLog2 to check the same
++-- callback used in more than one point.
++SELECT injection_points_detach('TestInjectionLog'); -- ok
++ injection_points_detach 
++-------------------------
++ 
++(1 row)
++
++SELECT injection_points_run('TestInjectionLog'); -- nothing
++ injection_points_run 
++----------------------
++ 
++(1 row)
++
++SELECT injection_points_run('TestInjectionError'); -- nothing
++ injection_points_run 
++----------------------
++ 
++(1 row)
++
++SELECT injection_points_run('TestInjectionLog2'); -- notice
++NOTICE:  notice triggered for injection point TestInjectionLog2
++ injection_points_run 
++----------------------
++ 
++(1 row)
++
++SELECT injection_points_detach('TestInjectionLog'); -- fails
++ERROR:  could not detach injection point "TestInjectionLog"
++SELECT injection_points_run('TestInjectionLog2'); -- notice
++NOTICE:  notice triggered for injection point TestInjectionLog2
++ injection_points_run 
++----------------------
++ 
++(1 row)
++
++SELECT injection_points_detach('TestInjectionLog2');
++ injection_points_detach 
++-------------------------
++ 
++(1 row)
++
++-- Loading
++SELECT injection_points_cached('TestInjectionLogLoad'); -- nothing in cache
++ injection_points_cached 
++-------------------------
++ 
++(1 row)
++
++SELECT injection_points_load('TestInjectionLogLoad'); -- nothing
++ injection_points_load 
++-----------------------
++ 
++(1 row)
++
++SELECT injection_points_attach('TestInjectionLogLoad', 'notice');
++ injection_points_attach 
++-------------------------
++ 
++(1 row)
++
++SELECT injection_points_load('TestInjectionLogLoad'); -- nothing happens
++ injection_points_load 
++-----------------------
++ 
++(1 row)
++
++SELECT injection_points_cached('TestInjectionLogLoad'); -- runs from cache
++NOTICE:  notice triggered for injection point TestInjectionLogLoad
++ injection_points_cached 
++-------------------------
++ 
++(1 row)
++
++SELECT injection_points_cached('TestInjectionLogLoad', NULL); -- runs from cache
++NOTICE:  notice triggered for injection point TestInjectionLogLoad
++ injection_points_cached 
++-------------------------
++ 
++(1 row)
++
++SELECT injection_points_cached('TestInjectionLogLoad', 'foobar'); -- runs from cache
++NOTICE:  notice triggered for injection point TestInjectionLogLoad (foobar)
++ injection_points_cached 
++-------------------------
++ 
++(1 row)
++
++SELECT injection_points_run('TestInjectionLogLoad'); -- runs from cache
++NOTICE:  notice triggered for injection point TestInjectionLogLoad
++ injection_points_run 
++----------------------
++ 
++(1 row)
++
++SELECT injection_points_detach('TestInjectionLogLoad');
++ injection_points_detach 
++-------------------------
++ 
++(1 row)
++
++-- Runtime conditions
++SELECT injection_points_attach('TestConditionError', 'error');
++ injection_points_attach 
++-------------------------
++ 
++(1 row)
++
++-- Any follow-up injection point attached will be local to this process.
++SELECT injection_points_set_local();
++ injection_points_set_local 
++----------------------------
++ 
++(1 row)
++
++SELECT injection_points_attach('TestConditionLocal1', 'error');
++ injection_points_attach 
++-------------------------
++ 
++(1 row)
++
++SELECT injection_points_attach('TestConditionLocal2', 'notice');
++ injection_points_attach 
++-------------------------
++ 
++(1 row)
++
++SELECT injection_points_run('TestConditionLocal1'); -- error
++ERROR:  error triggered for injection point TestConditionLocal1
++SELECT injection_points_run('TestConditionLocal2'); -- notice
++NOTICE:  notice triggered for injection point TestConditionLocal2
++ injection_points_run 
++----------------------
++ 
++(1 row)
++
++SELECT pg_backend_pid() AS oldpid \gset
++-- reload, local injection points should be gone.
++\c
++-- Wait for the previous backend process to exit, ensuring that its local
++-- injection points are cleaned up.
++SELECT wait_pid(:'oldpid');
++ wait_pid 
++----------
++ 
++(1 row)
++
++SELECT injection_points_run('TestConditionLocal1'); -- nothing
++ injection_points_run 
++----------------------
++ 
++(1 row)
++
++SELECT injection_points_run('TestConditionLocal2'); -- nothing
++ injection_points_run 
++----------------------
++ 
++(1 row)
++
++SELECT injection_points_run('TestConditionError'); -- error
++ERROR:  error triggered for injection point TestConditionError
++SELECT injection_points_detach('TestConditionError');
++ injection_points_detach 
++-------------------------
++ 
++(1 row)
++
++-- Attaching injection points that use the same name as one defined locally
++-- previously should work.
++SELECT injection_points_attach('TestConditionLocal1', 'error');
++ injection_points_attach 
++-------------------------
++ 
++(1 row)
++
++SELECT injection_points_detach('TestConditionLocal1');
++ injection_points_detach 
++-------------------------
++ 
++(1 row)
++
++DROP EXTENSION injection_points;
++DROP FUNCTION wait_pid;
+diff --git a/src/test/modules/injection_points/injection_points--1.0.sql b/src/test/modules/injection_points/injection_points--1.0.sql
+new file mode 100644
+index 0000000000..8a581b9a57
+--- /dev/null
++++ b/src/test/modules/injection_points/injection_points--1.0.sql
+@@ -0,0 +1,100 @@
++/* src/test/modules/injection_points/injection_points--1.0.sql */
++
++-- complain if script is sourced in psql, rather than via CREATE EXTENSION
++\echo Use "CREATE EXTENSION injection_points" to load this file. \quit
++
++--
++-- injection_points_attach()
++--
++-- Attaches the action to the given injection point.
++--
++CREATE FUNCTION injection_points_attach(IN point_name TEXT,
++    IN action text)
++RETURNS void
++AS 'MODULE_PATHNAME', 'injection_points_attach'
++LANGUAGE C STRICT PARALLEL UNSAFE;
++
++--
++-- injection_points_load()
++--
++-- Load an injection point already attached.
++--
++CREATE FUNCTION injection_points_load(IN point_name TEXT)
++RETURNS void
++AS 'MODULE_PATHNAME', 'injection_points_load'
++LANGUAGE C STRICT PARALLEL UNSAFE;
++
++--
++-- injection_points_run()
++--
++-- Executes the action attached to the injection point.
++--
++CREATE FUNCTION injection_points_run(IN point_name TEXT,
++    IN arg TEXT DEFAULT NULL)
++RETURNS void
++AS 'MODULE_PATHNAME', 'injection_points_run'
++LANGUAGE C PARALLEL UNSAFE;
++
++--
++-- injection_points_cached()
++--
++-- Executes the action attached to the injection point, from local cache.
++--
++CREATE FUNCTION injection_points_cached(IN point_name TEXT,
++    IN arg TEXT DEFAULT NULL)
++RETURNS void
++AS 'MODULE_PATHNAME', 'injection_points_cached'
++LANGUAGE C PARALLEL UNSAFE;
++
++--
++-- injection_points_wakeup()
++--
++-- Wakes up a waiting injection point.
++--
++CREATE FUNCTION injection_points_wakeup(IN point_name TEXT)
++RETURNS void
++AS 'MODULE_PATHNAME', 'injection_points_wakeup'
++LANGUAGE C STRICT PARALLEL UNSAFE;
++
++--
++-- injection_points_set_local()
++--
++-- Trigger switch to link any future injection points attached to the
++-- current process, useful to make SQL tests concurrently-safe.
++--
++CREATE FUNCTION injection_points_set_local()
++RETURNS void
++AS 'MODULE_PATHNAME', 'injection_points_set_local'
++LANGUAGE C STRICT PARALLEL UNSAFE;
++
++--
++-- injection_points_detach()
++--
++-- Detaches the current action, if any, from the given injection point.
++--
++CREATE FUNCTION injection_points_detach(IN point_name TEXT)
++RETURNS void
++AS 'MODULE_PATHNAME', 'injection_points_detach'
++LANGUAGE C STRICT PARALLEL UNSAFE;
++
++--
++-- injection_points_stats_numcalls()
++--
++-- Reports statistics, if any, related to the given injection point.
++--
++CREATE FUNCTION injection_points_stats_numcalls(IN point_name TEXT)
++RETURNS bigint
++AS 'MODULE_PATHNAME', 'injection_points_stats_numcalls'
++LANGUAGE C STRICT;
++
++--
++-- injection_points_stats_drop()
++--
++-- Drop all statistics of injection points.
++--
++CREATE FUNCTION injection_points_stats_drop()
++RETURNS void
++AS 'MODULE_PATHNAME', 'injection_points_stats_drop'
++LANGUAGE C STRICT;
++
++
+diff --git a/src/test/modules/injection_points/injection_points.c b/src/test/modules/injection_points/injection_points.c
+new file mode 100644
+index 0000000000..41450086ed
+--- /dev/null
++++ b/src/test/modules/injection_points/injection_points.c
+@@ -0,0 +1,751 @@
++/*--------------------------------------------------------------------------
++ *
++ * injection_points.c
++ *		Code for testing injection points.
++ *
++ * Injection points are able to trigger user-defined callbacks in pre-defined
++ * code paths.
++ *
++ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
++ * Portions Copyright (c) 1994, Regents of the University of California
++ *
++ * IDENTIFICATION
++ *		src/test/modules/injection_points/injection_points.c
++ *
++ * -------------------------------------------------------------------------
++ */
++
++#include "postgres.h"
++
++#include "fmgr.h"
++#include "miscadmin.h"
++#include "nodes/pg_list.h"
++#include "nodes/value.h"
++#include "storage/condition_variable.h"
++#include "storage/ipc.h"
++#include "storage/latch.h"
++#include "storage/lwlock.h"
++#include "storage/shmem.h"
++#include "utils/builtins.h"
++#include "utils/guc.h"
++#include "utils/injection_point.h"
++#include "utils/memutils.h"
++#include "utils/wait_event.h"
++
++PG_MODULE_MAGIC;
++
++/* Maximum number of waits usable in injection points at once */
++#define INJ_MAX_WAIT	8
++#define INJ_NAME_MAXLEN	64
++#define INJ_MAX_STATS	128
++
++/*
++ * Conditions related to injection points.  This tracks in shared memory the
++ * runtime conditions under which an injection point is allowed to run,
++ * stored as private_data when an injection point is attached, and passed as
++ * argument to the callback.
++ *
++ * If more types of runtime conditions need to be expanded, this structure
++ * should be expanded.
++ */
++typedef enum InjectionPointConditionType
++{
++	INJ_CONDITION_ALWAYS = 0,	/* always run */
++	INJ_CONDITION_PID,			/* PID restriction */
++} InjectionPointConditionType;
++
++typedef struct InjectionPointCondition
++{
++	/* Type of the condition */
++	InjectionPointConditionType type;
++
++	/* ID of the process where the injection point is allowed to run */
++	int			pid;
++} InjectionPointCondition;
++
++/*
++ * List of injection points stored in TopMemoryContext attached
++ * locally to this process.
++ */
++static List *inj_list_local = NIL;
++
++/*
++ * Simple statistics for injection points (numcalls).
++ */
++typedef struct InjectionPointStat
++{
++	char		name[INJ_NAME_MAXLEN];
++	pg_atomic_uint64 numcalls;
++} InjectionPointStat;
++
++/*
++ * Shared state information for injection points.
++ */
++typedef struct InjectionPointSharedState
++{
++	/* Protects access to other fields */
++	slock_t		lock;
++
++	/* Counters advancing when injection_points_wakeup() is called */
++	uint32		wait_counts[INJ_MAX_WAIT];
++
++	/* Names of injection points attached to wait counters */
++	char		name[INJ_MAX_WAIT][INJ_NAME_MAXLEN];
++
++	/* Condition variable used for waits and wakeups */
++	ConditionVariable wait_point;
++
++	/* Statistics */
++	InjectionPointStat stats[INJ_MAX_STATS];
++} InjectionPointSharedState;
++
++/* Pointer to shared-memory state. */
++static InjectionPointSharedState *inj_state = NULL;
++
++extern PGDLLEXPORT void injection_error(const char *name,
++										const void *private_data,
++										void *arg);
++extern PGDLLEXPORT void injection_notice(const char *name,
++										 const void *private_data,
++										 void *arg);
++extern PGDLLEXPORT void injection_wait(const char *name,
++									   const void *private_data,
++									   void *arg);
++
++/* track if injection points attached in this process are linked to it */
++static bool injection_point_local = false;
++
++/*
++ * GUC variable
++ *
++ * This GUC is useful to control if statistics should be enabled or not
++ * during a test with injection points, like for example if a test relies
++ * on a callback run in a critical section where no allocation should happen.
++ */
++bool		inj_stats_enabled = false;
++
++/* Shared memory init callbacks */
++static shmem_request_hook_type prev_shmem_request_hook = NULL;
++static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
++
++/*
++ * Routine for shared memory area initialization.
++ */
++static void
++injection_point_init_state(void *ptr)
++{
++	InjectionPointSharedState *state = (InjectionPointSharedState *) ptr;
++
++	SpinLockInit(&state->lock);
++	memset(state->wait_counts, 0, sizeof(state->wait_counts));
++	memset(state->name, 0, sizeof(state->name));
++	ConditionVariableInit(&state->wait_point);
++	
++	/* Initialize stats */
++	for (int i = 0; i < INJ_MAX_STATS; i++)
++	{
++		state->stats[i].name[0] = '\0';
++		pg_atomic_init_u64(&state->stats[i].numcalls, 0);
++	}
++}
++
++/* Shared memory initialization when loading module */
++static void
++injection_shmem_request(void)
++{
++	Size		size;
++
++	if (prev_shmem_request_hook)
++		prev_shmem_request_hook();
++
++	size = MAXALIGN(sizeof(InjectionPointSharedState));
++	RequestAddinShmemSpace(size);
++}
++
++static void
++injection_shmem_startup(void)
++{
++	bool		found;
++
++	if (prev_shmem_startup_hook)
++		prev_shmem_startup_hook();
++
++	/* Create or attach to the shared memory state */
++	LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
++
++	inj_state = ShmemInitStruct("injection_points",
++								sizeof(InjectionPointSharedState),
++								&found);
++
++	if (!found)
++	{
++		/*
++		 * First time through, so initialize.
++		 */
++		injection_point_init_state(inj_state);
++	}
++
++	LWLockRelease(AddinShmemInitLock);
++}
++
++static void
++injection_init_shmem(void)
++{
++	if (inj_state != NULL)
++		return;
++
++	ereport(ERROR,
++			(errmsg("injection_points must be loaded via shared_preload_libraries")));
++}
++
++/*
++ * Check runtime conditions associated to an injection point.
++ *
++ * Returns true if the named injection point is allowed to run, and false
++ * otherwise.
++ */
++static bool
++injection_point_allowed(InjectionPointCondition *condition)
++{
++	bool		result = true;
++
++	switch (condition->type)
++	{
++		case INJ_CONDITION_PID:
++			if (MyProcPid != condition->pid)
++				result = false;
++			break;
++		case INJ_CONDITION_ALWAYS:
++			break;
++	}
++
++	return result;
++}
++
++/*
++ * Local statistics helpers
++ */
++static void
++pgstat_create_inj(const char *name)
++{
++	if (!inj_stats_enabled || inj_state == NULL)
++		return;
++
++	SpinLockAcquire(&inj_state->lock);
++	for (int i = 0; i < INJ_MAX_STATS; i++)
++	{
++		if (inj_state->stats[i].name[0] == '\0')
++		{
++			strlcpy(inj_state->stats[i].name, name, INJ_NAME_MAXLEN);
++			pg_atomic_write_u64(&inj_state->stats[i].numcalls, 0);
++			break;
++		}
++	}
++	SpinLockRelease(&inj_state->lock);
++}
++
++static void
++pgstat_drop_inj(const char *name)
++{
++	if (!inj_stats_enabled || inj_state == NULL)
++		return;
++
++	SpinLockAcquire(&inj_state->lock);
++	for (int i = 0; i < INJ_MAX_STATS; i++)
++	{
++		if (strcmp(inj_state->stats[i].name, name) == 0)
++		{
++			inj_state->stats[i].name[0] = '\0';
++			break;
++		}
++	}
++	SpinLockRelease(&inj_state->lock);
++}
++
++static void
++pgstat_report_inj(const char *name)
++{
++	int index = -1;
++
++	if (!inj_stats_enabled || inj_state == NULL)
++		return;
++
++	/* 
++	 * We don't hold the lock while updating the counter for better concurrency.
++	 */
++	SpinLockAcquire(&inj_state->lock);
++	for (int i = 0; i < INJ_MAX_STATS; i++)
++	{
++		if (strcmp(inj_state->stats[i].name, name) == 0)
++		{
++			index = i;
++			break;
++		}
++	}
++	SpinLockRelease(&inj_state->lock);
++
++	if (index >= 0)
++		pg_atomic_fetch_add_u64(&inj_state->stats[index].numcalls, 1);
++}
++
++/* Stub for fixed stats report */
++static void
++pgstat_report_inj_fixed(uint32 numattach, uint32 numdetach, uint32 numrun, uint32 numcached, uint32 numloaded)
++{
++	(void) numattach;
++	(void) numdetach;
++	(void) numrun;
++	(void) numcached;
++	(void) numloaded;
++}
++
++
++/*
++ * before_shmem_exit callback to remove injection points linked to a
++ * specific process.
++ */
++static void
++injection_points_cleanup(int code, Datum arg)
++{
++	ListCell   *lc;
++
++	/* Leave if nothing is tracked locally */
++	if (!injection_point_local)
++		return;
++
++	/* Detach all the local points */
++	foreach(lc, inj_list_local)
++	{
++		char	   *name = strVal(lfirst(lc));
++
++		(void) InjectionPointDetach(name);
++
++		/* Remove stats entry */
++		pgstat_drop_inj(name);
++	}
++}
++
++/* Set of callbacks available to be attached to an injection point. */
++void
++injection_error(const char *name, const void *private_data, void *arg)
++{
++	InjectionPointCondition *condition = (InjectionPointCondition *) private_data;
++	char	   *argstr = (char *) arg;
++
++	if (!injection_point_allowed(condition))
++		return;
++
++	pgstat_report_inj(name);
++
++	if (argstr)
++		elog(ERROR, "error triggered for injection point %s (%s)",
++			 name, argstr);
++	else
++		elog(ERROR, "error triggered for injection point %s", name);
++}
++
++void
++injection_notice(const char *name, const void *private_data, void *arg)
++{
++	InjectionPointCondition *condition = (InjectionPointCondition *) private_data;
++	char	   *argstr = (char *) arg;
++
++	if (!injection_point_allowed(condition))
++		return;
++
++	pgstat_report_inj(name);
++
++	if (argstr)
++		elog(NOTICE, "notice triggered for injection point %s (%s)",
++			 name, argstr);
++	else
++		elog(NOTICE, "notice triggered for injection point %s", name);
++}
++
++/* Wait on a condition variable, awaken by injection_points_wakeup() */
++void
++injection_wait(const char *name, const void *private_data, void *arg)
++{
++	uint32		old_wait_counts = 0;
++	int			index = -1;
++	uint32		injection_wait_event = 0;
++	InjectionPointCondition *condition = (InjectionPointCondition *) private_data;
++
++	if (inj_state == NULL)
++		injection_init_shmem();
++
++	if (!injection_point_allowed(condition))
++		return;
++
++	pgstat_report_inj(name);
++
++	/*
++	 * Use PG_WAIT_EXTENSION for custom wait event.
++	 */
++	injection_wait_event = PG_WAIT_EXTENSION;
++
++	/*
++	 * Find a free slot to wait for, and register this injection point's name.
++	 */
++	SpinLockAcquire(&inj_state->lock);
++	for (int i = 0; i < INJ_MAX_WAIT; i++)
++	{
++		if (inj_state->name[i][0] == '\0')
++		{
++			index = i;
++			strlcpy(inj_state->name[i], name, INJ_NAME_MAXLEN);
++			old_wait_counts = inj_state->wait_counts[i];
++			break;
++		}
++	}
++	SpinLockRelease(&inj_state->lock);
++
++	if (index < 0)
++		elog(ERROR, "could not find free slot for wait of injection point %s ",
++			 name);
++
++	/* And sleep.. */
++	ConditionVariablePrepareToSleep(&inj_state->wait_point);
++    PG_TRY();
++    {
++        for (;;)
++        {
++            uint32      new_wait_counts;
++
++            SpinLockAcquire(&inj_state->lock);
++            new_wait_counts = inj_state->wait_counts[index];
++            SpinLockRelease(&inj_state->lock);
++
++            if (old_wait_counts != new_wait_counts)
++                break;
++
++            /*
++             * If the user sends a cancel signal (Ctrl+C), we generally want to
++             * stop waiting, even if interrupts are technically held off (e.g.
++             * by a buffer lock).  We check QueryCancelPending manually here
++             * to allow breaking out.  We must clear the flag so that the
++             * standard interrupt handler doesn't throw an error later.
++             */
++            if (QueryCancelPending)
++            {
++                QueryCancelPending = false;
++                break;
++            }
++
++            /*
++             * We use WaitLatch directly instead of ConditionVariableSleep() because
++             * ConditionVariableSleep() calls CHECK_FOR_INTERRUPTS(), which usually
++             * does nothing if we are holding a lock (WaitEventInjectionPoint),
++             * causing the process to hang and ignore our manual check above.
++             * By using WaitLatch, we ensure we return on any signal (including
++             * cancel) to re-evaluate our loop condition.
++             */
++            WaitLatch(MyLatch, WL_LATCH_SET | WL_EXIT_ON_PM_DEATH, 0,
++                      injection_wait_event);
++            ResetLatch(MyLatch);
++        }
++    }
++    PG_CATCH();
++    {
++        ConditionVariableCancelSleep();
++        if (geterrcode() == ERRCODE_QUERY_CANCELED)
++        {
++            FlushErrorState();
++        }
++        else
++        {
++            PG_RE_THROW();
++        }
++    }
++    PG_END_TRY();
++	ConditionVariableCancelSleep();
++
++	/* Remove this injection point from the waiters. */
++	SpinLockAcquire(&inj_state->lock);
++	inj_state->name[index][0] = '\0';
++	SpinLockRelease(&inj_state->lock);
++}
++
++/*
++ * SQL function for creating an injection point.
++ */
++PG_FUNCTION_INFO_V1(injection_points_attach);
++Datum
++injection_points_attach(PG_FUNCTION_ARGS)
++{
++	char	   *name = text_to_cstring(PG_GETARG_TEXT_PP(0));
++	char	   *action = text_to_cstring(PG_GETARG_TEXT_PP(1));
++	char	   *function;
++	InjectionPointCondition condition = {0};
++
++	if (strcmp(action, "error") == 0)
++		function = "injection_error";
++	else if (strcmp(action, "notice") == 0)
++		function = "injection_notice";
++	else if (strcmp(action, "wait") == 0)
++		function = "injection_wait";
++	else
++		elog(ERROR, "incorrect action \"%s\" for injection point creation", action);
++
++	if (injection_point_local)
++	{
++		condition.type = INJ_CONDITION_PID;
++		condition.pid = MyProcPid;
++	}
++
++	pgstat_report_inj_fixed(1, 0, 0, 0, 0);
++	InjectionPointAttach(name, "injection_points", function, &condition,
++						 sizeof(InjectionPointCondition));
++
++	if (injection_point_local)
++	{
++		MemoryContext oldctx;
++
++		/* Local injection point, so track it for automated cleanup */
++		oldctx = MemoryContextSwitchTo(TopMemoryContext);
++		inj_list_local = lappend(inj_list_local, makeString(pstrdup(name)));
++		MemoryContextSwitchTo(oldctx);
++	}
++
++	/* Add entry for stats */
++	pgstat_create_inj(name);
++
++	PG_RETURN_VOID();
++}
++
++/*
++ * SQL function for loading an injection point.
++ */
++PG_FUNCTION_INFO_V1(injection_points_load);
++Datum
++injection_points_load(PG_FUNCTION_ARGS)
++{
++	char	   *name = text_to_cstring(PG_GETARG_TEXT_PP(0));
++
++	if (inj_state == NULL)
++		injection_init_shmem();
++
++	pgstat_report_inj_fixed(0, 0, 0, 0, 1);
++	INJECTION_POINT_LOAD(name);
++
++	PG_RETURN_VOID();
++}
++
++/*
++ * SQL function for triggering an injection point.
++ */
++PG_FUNCTION_INFO_V1(injection_points_run);
++Datum
++injection_points_run(PG_FUNCTION_ARGS)
++{
++	char	   *name;
++	char	   *arg = NULL;
++
++	if (PG_ARGISNULL(0))
++		PG_RETURN_VOID();
++	name = text_to_cstring(PG_GETARG_TEXT_PP(0));
++
++	if (!PG_ARGISNULL(1))
++		arg = text_to_cstring(PG_GETARG_TEXT_PP(1));
++
++	pgstat_report_inj_fixed(0, 0, 1, 0, 0);
++	INJECTION_POINT(name, arg);
++
++	PG_RETURN_VOID();
++}
++
++/*
++ * SQL function for triggering an injection point from cache.
++ */
++PG_FUNCTION_INFO_V1(injection_points_cached);
++Datum
++injection_points_cached(PG_FUNCTION_ARGS)
++{
++	char	   *name;
++	char	   *arg = NULL;
++
++	if (PG_ARGISNULL(0))
++		PG_RETURN_VOID();
++	name = text_to_cstring(PG_GETARG_TEXT_PP(0));
++
++	if (!PG_ARGISNULL(1))
++		arg = text_to_cstring(PG_GETARG_TEXT_PP(1));
++
++	pgstat_report_inj_fixed(0, 0, 0, 1, 0);
++	INJECTION_POINT_CACHED(name, arg);
++
++	PG_RETURN_VOID();
++}
++
++/*
++ * SQL function for waking up an injection point waiting in injection_wait().
++ */
++PG_FUNCTION_INFO_V1(injection_points_wakeup);
++Datum
++injection_points_wakeup(PG_FUNCTION_ARGS)
++{
++	char	   *name = text_to_cstring(PG_GETARG_TEXT_PP(0));
++	int			index = -1;
++
++	if (inj_state == NULL)
++		injection_init_shmem();
++
++	/* First bump the wait counter for the injection point to wake up */
++	SpinLockAcquire(&inj_state->lock);
++	for (int i = 0; i < INJ_MAX_WAIT; i++)
++	{
++		if (strcmp(name, inj_state->name[i]) == 0)
++		{
++			index = i;
++			break;
++		}
++	}
++	if (index < 0)
++	{
++		SpinLockRelease(&inj_state->lock);
++		elog(ERROR, "could not find injection point %s to wake up", name);
++	}
++	inj_state->wait_counts[index]++;
++	SpinLockRelease(&inj_state->lock);
++
++	/* And broadcast the change to the waiters */
++	ConditionVariableBroadcast(&inj_state->wait_point);
++	PG_RETURN_VOID();
++}
++
++/*
++ * injection_points_set_local
++ *
++ * Track if any injection point created in this process ought to run only
++ * in this process.  Such injection points are detached automatically when
++ * this process exits.  This is useful to make test suites concurrent-safe.
++ */
++PG_FUNCTION_INFO_V1(injection_points_set_local);
++Datum
++injection_points_set_local(PG_FUNCTION_ARGS)
++{
++	/* Enable flag to add a runtime condition based on this process ID */
++	injection_point_local = true;
++
++	if (inj_state == NULL)
++		injection_init_shmem();
++
++	/*
++	 * Register a before_shmem_exit callback to remove any injection points
++	 * linked to this process.
++	 */
++	before_shmem_exit(injection_points_cleanup, (Datum) 0);
++
++	PG_RETURN_VOID();
++}
++
++/*
++ * SQL function for dropping an injection point.
++ */
++PG_FUNCTION_INFO_V1(injection_points_detach);
++Datum
++injection_points_detach(PG_FUNCTION_ARGS)
++{
++	char	   *name = text_to_cstring(PG_GETARG_TEXT_PP(0));
++
++	pgstat_report_inj_fixed(0, 1, 0, 0, 0);
++	if (!InjectionPointDetach(name))
++		elog(ERROR, "could not detach injection point \"%s\"", name);
++
++	/* Remove point from local list, if required */
++	if (inj_list_local != NIL)
++	{
++		MemoryContext oldctx;
++
++		oldctx = MemoryContextSwitchTo(TopMemoryContext);
++		inj_list_local = list_delete(inj_list_local, makeString(name));
++		MemoryContextSwitchTo(oldctx);
++	}
++
++	/* Remove stats entry */
++	pgstat_drop_inj(name);
++
++	PG_RETURN_VOID();
++}
++
++/*
++ * SQL function returning the number of times an injection point
++ * has been called.
++ */
++PG_FUNCTION_INFO_V1(injection_points_stats_numcalls);
++Datum
++injection_points_stats_numcalls(PG_FUNCTION_ARGS)
++{
++	char	   *name = text_to_cstring(PG_GETARG_TEXT_PP(0));
++	uint64		numcalls = 0;
++	int			index = -1;
++
++	if (inj_state == NULL)
++		PG_RETURN_NULL();
++
++	SpinLockAcquire(&inj_state->lock);
++	for (int i = 0; i < INJ_MAX_STATS; i++)
++	{
++		if (strcmp(inj_state->stats[i].name, name) == 0)
++		{
++			index = i;
++			break;
++		}
++	}
++	SpinLockRelease(&inj_state->lock);
++
++	if (index >= 0)
++	{
++		numcalls = pg_atomic_read_u64(&inj_state->stats[index].numcalls);
++		PG_RETURN_INT64(numcalls);
++	}
++	
++	PG_RETURN_NULL();
++}
++
++/*
++ * SQL function that drops all injection point statistics.
++ */
++PG_FUNCTION_INFO_V1(injection_points_stats_drop);
++Datum
++injection_points_stats_drop(PG_FUNCTION_ARGS)
++{
++	if (inj_state == NULL)
++		PG_RETURN_VOID();
++
++	SpinLockAcquire(&inj_state->lock);
++	for (int i = 0; i < INJ_MAX_STATS; i++)
++	{
++		inj_state->stats[i].name[0] = '\0';
++		pg_atomic_write_u64(&inj_state->stats[i].numcalls, 0);
++	}
++	SpinLockRelease(&inj_state->lock);
++
++	PG_RETURN_VOID();
++}
++
++void
++_PG_init(void)
++{
++	if (!process_shared_preload_libraries_in_progress)
++		return;
++
++	DefineCustomBoolVariable("injection_points.stats",
++							 "Enables statistics for injection points.",
++							 NULL,
++							 &inj_stats_enabled,
++							 false,
++							 PGC_POSTMASTER,
++							 0,
++							 NULL,
++							 NULL,
++							 NULL);
++
++	MarkGUCPrefixReserved("injection_points");
++
++	/* Shared memory initialization */
++	prev_shmem_request_hook = shmem_request_hook;
++	shmem_request_hook = injection_shmem_request;
++	prev_shmem_startup_hook = shmem_startup_hook;
++	shmem_startup_hook = injection_shmem_startup;
++}
+diff --git a/src/test/modules/injection_points/injection_points.conf b/src/test/modules/injection_points/injection_points.conf
+new file mode 100644
+index 0000000000..79c708ae20
+--- /dev/null
++++ b/src/test/modules/injection_points/injection_points.conf
+@@ -0,0 +1 @@
++shared_preload_libraries = 'injection_points'
+diff --git a/src/test/modules/injection_points/injection_points.control b/src/test/modules/injection_points/injection_points.control
+new file mode 100644
+index 0000000000..b4214f3bdc
+--- /dev/null
++++ b/src/test/modules/injection_points/injection_points.control
+@@ -0,0 +1,4 @@
++comment = 'Test code for injection points'
++default_version = '1.0'
++module_pathname = '$libdir/injection_points'
++relocatable = true
+diff --git a/src/test/modules/injection_points/sql/injection_points.sql b/src/test/modules/injection_points/sql/injection_points.sql
+new file mode 100644
+index 0000000000..d9748331c7
+--- /dev/null
++++ b/src/test/modules/injection_points/sql/injection_points.sql
+@@ -0,0 +1,89 @@
++CREATE EXTENSION injection_points;
++
++\getenv libdir PG_LIBDIR
++\getenv dlsuffix PG_DLSUFFIX
++\set regresslib :libdir '/regress' :dlsuffix
++
++CREATE FUNCTION wait_pid(int)
++  RETURNS void
++  AS :'regresslib'
++  LANGUAGE C STRICT;
++
++-- Non-strict checks
++SELECT injection_points_run(NULL);
++SELECT injection_points_cached(NULL);
++
++SELECT injection_points_attach('TestInjectionBooh', 'booh');
++SELECT injection_points_attach('TestInjectionError', 'error');
++SELECT injection_points_attach('TestInjectionLog', 'notice');
++SELECT injection_points_attach('TestInjectionLog2', 'notice');
++
++SELECT injection_points_run('TestInjectionBooh'); -- nothing
++SELECT injection_points_run('TestInjectionLog2'); -- notice
++SELECT injection_points_run('TestInjectionLog2', NULL); -- notice
++SELECT injection_points_run('TestInjectionLog2', 'foobar'); -- notice + arg
++SELECT injection_points_run('TestInjectionLog'); -- notice
++SELECT injection_points_run('TestInjectionError'); -- error
++SELECT injection_points_run('TestInjectionError', NULL); -- error
++SELECT injection_points_run('TestInjectionError', 'foobar2'); -- error + arg
++
++-- Re-load cache and run again.
++\c
++SELECT injection_points_run('TestInjectionLog2'); -- notice
++SELECT injection_points_run('TestInjectionLog'); -- notice
++SELECT injection_points_run('TestInjectionError'); -- error
++
++-- Remove one entry and check the remaining entries.
++SELECT injection_points_detach('TestInjectionError'); -- ok
++SELECT injection_points_run('TestInjectionLog'); -- notice
++SELECT injection_points_run('TestInjectionError'); -- nothing
++-- More entries removed, letting TestInjectionLog2 to check the same
++-- callback used in more than one point.
++SELECT injection_points_detach('TestInjectionLog'); -- ok
++SELECT injection_points_run('TestInjectionLog'); -- nothing
++SELECT injection_points_run('TestInjectionError'); -- nothing
++SELECT injection_points_run('TestInjectionLog2'); -- notice
++
++SELECT injection_points_detach('TestInjectionLog'); -- fails
++
++SELECT injection_points_run('TestInjectionLog2'); -- notice
++SELECT injection_points_detach('TestInjectionLog2');
++
++-- Loading
++SELECT injection_points_cached('TestInjectionLogLoad'); -- nothing in cache
++SELECT injection_points_load('TestInjectionLogLoad'); -- nothing
++SELECT injection_points_attach('TestInjectionLogLoad', 'notice');
++SELECT injection_points_load('TestInjectionLogLoad'); -- nothing happens
++SELECT injection_points_cached('TestInjectionLogLoad'); -- runs from cache
++SELECT injection_points_cached('TestInjectionLogLoad', NULL); -- runs from cache
++SELECT injection_points_cached('TestInjectionLogLoad', 'foobar'); -- runs from cache
++SELECT injection_points_run('TestInjectionLogLoad'); -- runs from cache
++SELECT injection_points_detach('TestInjectionLogLoad');
++
++-- Runtime conditions
++SELECT injection_points_attach('TestConditionError', 'error');
++-- Any follow-up injection point attached will be local to this process.
++SELECT injection_points_set_local();
++SELECT injection_points_attach('TestConditionLocal1', 'error');
++SELECT injection_points_attach('TestConditionLocal2', 'notice');
++SELECT injection_points_run('TestConditionLocal1'); -- error
++SELECT injection_points_run('TestConditionLocal2'); -- notice
++
++SELECT pg_backend_pid() AS oldpid \gset
++
++-- reload, local injection points should be gone.
++\c
++-- Wait for the previous backend process to exit, ensuring that its local
++-- injection points are cleaned up.
++SELECT wait_pid(:'oldpid');
++SELECT injection_points_run('TestConditionLocal1'); -- nothing
++SELECT injection_points_run('TestConditionLocal2'); -- nothing
++SELECT injection_points_run('TestConditionError'); -- error
++SELECT injection_points_detach('TestConditionError');
++-- Attaching injection points that use the same name as one defined locally
++-- previously should work.
++SELECT injection_points_attach('TestConditionLocal1', 'error');
++SELECT injection_points_detach('TestConditionLocal1');
++
++DROP EXTENSION injection_points;
++DROP FUNCTION wait_pid;

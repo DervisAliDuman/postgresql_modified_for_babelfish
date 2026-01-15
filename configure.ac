@@ -19,10 +19,10 @@ m4_pattern_forbid(^PGAC_)dnl to catch undefined macros
 
 AC_INIT([PostgreSQL], [16.4], [pgsql-bugs@lists.postgresql.org], [], [https://www.postgresql.org/])
 
-m4_if(m4_defn([m4_PACKAGE_VERSION]), [2.69], [], [m4_fatal([Autoconf version 2.69 is required.
+m4_if(m4_defn([m4_PACKAGE_VERSION]), [2.69], [], [m4_if(m4_defn([m4_PACKAGE_VERSION]), [2.71], [], [m4_fatal([Autoconf version 2.69 or 2.71 is required.
 Untested combinations of 'autoconf' and PostgreSQL versions are not
 recommended.  You can remove the check from 'configure.ac' but it is then
-your responsibility whether the result works or not.])])
+your responsibility whether the result works or not.])])])
 AC_COPYRIGHT([Copyright (c) 1996-2023, PostgreSQL Global Development Group])
 AC_CONFIG_SRCDIR([src/backend/access/common/heaptuple.c])
 AC_CONFIG_AUX_DIR(config)
@@ -205,6 +205,13 @@ PGAC_ARG_BOOL(enable, atomics, yes,
 PGAC_ARG_BOOL(enable, debug, no,
               [build with debugging symbols (-g)])
 AC_SUBST(enable_debug)
+
+#
+# Injection points
+#
+PGAC_ARG_BOOL(enable, injection-points, no, [enable injection points (for testing)],
+              [AC_DEFINE([USE_INJECTION_POINTS], 1, [Define to 1 to build with injection points. (--enable-injection-points)])])
+AC_SUBST(enable_injection_points)
 
 #
 # --enable-profiling enables gcc profiling

@@ -1,0 +1,29 @@
+2026-01-09 16:15:59.265 +03 postmaster[42476] LOG:  starting PostgreSQL 16.4 on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.2.0-4ubuntu3) 13.2.0, 64-bit
+2026-01-09 16:15:59.265 +03 postmaster[42476] LOG:  listening on Unix socket "/tmp/pg_regress-SoTy9L/.s.PGSQL.61700"
+2026-01-09 16:15:59.266 +03 startup[42481] LOG:  database system was shut down at 2026-01-09 16:15:59 +03
+2026-01-09 16:15:59.268 +03 postmaster[42476] LOG:  database system is ready to accept connections
+2026-01-09 16:16:00.306 +03 client backend[42502] pg_regress/injection_points ERROR:  incorrect action "booh" for injection point creation
+2026-01-09 16:16:00.306 +03 client backend[42502] pg_regress/injection_points STATEMENT:  SELECT injection_points_attach('TestInjectionBooh', 'booh');
+2026-01-09 16:16:00.306 +03 client backend[42502] pg_regress/injection_points ERROR:  error triggered for injection point TestInjectionError
+2026-01-09 16:16:00.306 +03 client backend[42502] pg_regress/injection_points STATEMENT:  SELECT injection_points_run('TestInjectionError');
+2026-01-09 16:16:00.306 +03 client backend[42502] pg_regress/injection_points ERROR:  error triggered for injection point TestInjectionError
+2026-01-09 16:16:00.306 +03 client backend[42502] pg_regress/injection_points STATEMENT:  SELECT injection_points_run('TestInjectionError', NULL);
+2026-01-09 16:16:00.306 +03 client backend[42502] pg_regress/injection_points ERROR:  error triggered for injection point TestInjectionError (foobar2)
+2026-01-09 16:16:00.306 +03 client backend[42502] pg_regress/injection_points STATEMENT:  SELECT injection_points_run('TestInjectionError', 'foobar2');
+202026-01-09 16:16:25.358 +03 postmaster[41172] LOG:  could not open file "postmaster.pid": No such file or directory
+2026-01-09 16:16:25.358 +03 postmaster[41172] LOG:  performing immediate shutdown because data directory lock file is invalid
+2026-01-09 16:16:25.358 +03 postmaster[41172] LOG:  received immediate shutdown request
+2026-01-09 16:16:25.358 +03 postmaster[41172] LOG:  could not open file "postmaster.pid": No such file or directory
+2026-01-09 16:16:25.358 +03 postmaster[41172] LOG:  abnormal database system shutdown
+2026-01-09 16:16:25.360 +03 postmaster[41172] LOG:  database system is shut down
+regress/injection_points ERROR:  error triggered for injection point TestConditionLocal1
+2026-01-09 16:16:00.310 +03 client backend[42503] pg_regress/injection_points STATEMENT:  SELECT injection_points_run('TestConditionLocal1');
+2026-01-09 16:16:00.363 +03 client backend[42504] pg_regress/injection_points ERROR:  error triggered for injection point TestConditionError
+2026-01-09 16:16:00.363 +03 client backend[42504] pg_regress/injection_points STATEMENT:  SELECT injection_points_run('TestConditionError');
+2026-01-09 16:16:00.367 +03 postmaster[42476] LOG:  received fast shutdown request
+2026-01-09 16:16:00.367 +03 postmaster[42476] LOG:  aborting any active transactions
+2026-01-09 16:16:00.368 +03 postmaster[42476] LOG:  background worker "logical replication launcher" (PID 42484) exited with exit code 1
+2026-01-09 16:16:00.368 +03 checkpointer[42479] LOG:  shutting down
+2026-01-09 16:16:00.368 +03 checkpointer[42479] LOG:  checkpoint starting: shutdown immediate
+2026-01-09 16:16:00.376 +03 checkpointer[42479] LOG:  checkpoint complete: wrote 927 buffers (5.7%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.008 s, sync=0.001 s, total=0.008 s; sync files=0, longest=0.000 s, average=0.000 s; distance=4277 kB, estimate=4277 kB; lsn=0/191B0D0, redo lsn=0/191B0D0
+2026-01-09 16:16:00.383 +03 postmaster[42476] LOG:  database system is shut down
